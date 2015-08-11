@@ -1,0 +1,1286 @@
+/*
+ ***************************************************************************
+ * Ralink Tech Inc.
+ * 4F, No. 2 Technology 5th Rd.
+ * Science-based Industrial Park
+ * Hsin-chu, Taiwan, R.O.C.
+ *
+ * (c) Copyright 2002-2009, Ralink Technology, Inc.
+ *
+ * All rights reserved. Ralink's source code is an unpublished work and the
+ * use of a copyright notice does not imply otherwise. This source code
+ * contains confidential trade secret material of Ralink Tech. Any attemp
+ * or participation in deciphering, decoding, reverse engineering or in any
+ * way altering the source code is stricitly prohibited, unless the prior
+ * written consent of Ralink Technology, Inc. is obtained.
+ ***************************************************************************
+
+	Module Name:
+	cmm_loft_calbr.c
+
+	Abstract:
+	Tx LOFT calibration and profile related functions
+
+	Revision History:
+	Who         When          What
+	--------    ----------    ----------------------------------------------
+
+*/
+
+#include "rt_config.h"
+
+#ifdef RT6352
+#ifdef LOFT_IQ_CAL_SUPPORT
+
+/* #define mode 0 */
+
+#define LOFT	0x0
+#define IQ		0x1
+
+#define I_PATH	0x0
+#define Q_PATH	0x1
+
+#define CHAIN_0	0x0
+#define CHAIN_1	0x1
+
+#ifdef LOFT_IQ_CALBR_E2
+#define RF_ALC_NUM 16 
+#else
+#define RF_ALC_NUM 4 
+#endif /* LOFT_IQ_CALBR_E2 */
+
+#define CHAIN_NUM 2
+#define GAIN_ERROR_NUM 15
+#define PHASE_ERROR_NUM 31
+
+typedef struct _RF_REG_PAIR
+{
+	UCHAR Bank;
+	UCHAR Register;
+	UCHAR Value;
+} RF_REG_PAIR, *PRF_REG_PAIR;
+
+typedef struct _BBP_REG_PAIR
+{
+	UCHAR Register;
+	UCHAR Value;
+} BBP_REG_PAIR, *PBBP_REG_PAIR;
+
+static UCHAR SweetRange[] = {
+						0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 
+						0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 
+						0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 
+						0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 
+						0x00,
+						0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+						0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+						0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+						0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F};
+
+#define DC_SWEET_NUM sizeof(SweetRange)
+
+/* read FFT output */
+static VOID ReadFFT(RTMP_ADAPTER *pAd, OUT INT32 *outputI, OUT INT32 *outputQ, UCHAR type)
+{
+	UCHAR BBPValue = 0;
+
+	/* sanity check */
+	if ((type != LOFT) && (type != IQ))
+	{
+		DBGPRINT_ERR(("%s: Unknown calibration type = %u\n", __FUNCTION__, type));
+		return;
+	}
+
+	/* enable rx calibration */
+	BBPValue = 0x00;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	BBPValue = 0x9B;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+	while( BBPValue == 0x9B){
+		RTMPusecDelay(10);
+		RTMP_BBP_IO_READ8_BY_REG_ID(pAd, BBP_R159, &BBPValue);
+	}
+
+	/* carrier index */
+	BBPValue = 0xBA;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+
+	if (type == LOFT)
+	{
+		/* for LOFT calibration */
+		/* carrier index for DC (1x feq) of LOFT */
+		BBPValue = 0x0A;
+	}
+	else
+	{
+		/* for I/Q calibration */
+		/* carrier index for Imbalance (2x feq) of IQ */
+		BBPValue = 0x14;
+	}
+
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+	/* byte selection q[16] */
+	BBPValue = 0xBB;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	BBPValue = 0x05;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+	BBPValue = 0xBC;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	RTMP_BBP_IO_READ8_BY_REG_ID(pAd, BBP_R159, &BBPValue);
+	(*outputQ) |= ((BBPValue & 0x01) << 16);	
+
+	/* byte selection q[15:8] */	
+	BBPValue = 0xBB;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	BBPValue = 0x04;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+	BBPValue = 0xBC;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	RTMP_BBP_IO_READ8_BY_REG_ID(pAd, BBP_R159, &BBPValue);
+	(*outputQ) |= (BBPValue << 8);
+	
+	/* byte selection q[7:0] */
+	BBPValue = 0xBB;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	BBPValue = 0x03;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+	BBPValue = 0xBC;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	RTMP_BBP_IO_READ8_BY_REG_ID(pAd, BBP_R159, &BBPValue);
+	(*outputQ) |= BBPValue;
+	
+	/* byte selection i[16] */
+	BBPValue = 0xBB;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	BBPValue = 0x02;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+	BBPValue = 0xBC;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	RTMP_BBP_IO_READ8_BY_REG_ID(pAd, BBP_R159, &BBPValue);
+	(*outputI) |= ((BBPValue & 0x01) << 16);	
+
+	
+	/* byte selection i[15:8] */	
+	BBPValue = 0xBB;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	BBPValue = 0x01;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+	BBPValue = 0xBC;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	RTMP_BBP_IO_READ8_BY_REG_ID(pAd, BBP_R159, &BBPValue);
+	(*outputI) |= (BBPValue << 8);
+
+	/* byte selection i[7:0] */
+	BBPValue = 0xBB;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	BBPValue = 0x00;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+	BBPValue = 0xBC;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	RTMP_BBP_IO_READ8_BY_REG_ID(pAd, BBP_R159, &BBPValue);
+	(*outputI) |= BBPValue;
+
+}
+
+
+static VOID BasebandPreset(RTMP_ADAPTER *pAd, UCHAR chain)
+{
+	UINT32 MacValue = 0;
+	UCHAR BBPValue = 0;
+
+	/* hard reset */
+	RTMP_IO_READ32(pAd, MAC_SYS_CTRL, &MacValue);
+	MacValue = MacValue | 0x00000002;
+	RTMP_IO_WRITE32(pAd, MAC_SYS_CTRL, MacValue);
+
+	RtmpOsMsDelay(100);
+
+	RTMP_IO_READ32(pAd, MAC_SYS_CTRL, &MacValue);
+	MacValue = MacValue & (~0x00000002);
+	RTMP_IO_WRITE32(pAd, MAC_SYS_CTRL, MacValue);
+
+	/* generate single tone */
+#ifdef RELEASE_EXCLUDE
+	/* step 0 : change to Rbist mode (MT7650) */
+#endif /* RELEASE_EXCLUDE */
+	if (chain == CHAIN_0)
+	{
+		/* step 1 : chain0 calibration index */
+		BBPValue = 0x01;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+		BBPValue = 0x00;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+		/* step 2 : set Ant0 power */
+		BBPValue = 0x1a;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R23, BBPValue);
+		BBPValue = 0x00;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R24, BBPValue);
+	}
+	else if (chain == CHAIN_1)
+	{
+		/* step 1 : chain1 calibration index */
+		BBPValue = 0x01;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+		BBPValue = 0x01;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+		/* step 2 : set Ant1 power */
+		BBPValue = 0x00;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R23, BBPValue);
+		BBPValue = 0x1a;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R24, BBPValue);
+	}
+	else
+	{
+		DBGPRINT_ERR(("%s: Unknown chain = %u\n", __FUNCTION__, chain));
+		return;
+	}
+
+	/* step 3 : choose FFT tone generator index (to 0) */
+	BBPValue = 0xAA;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	BBPValue = 0x00;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+	/* step 4 : set subcarrier index (subsample ratio to 10 * 0.3125MHz) */
+	BBPValue = 0xAB;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	BBPValue = 0x0A;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+	/* step 5 : I/Q amplitude of tone gen0 */
+	BBPValue = 0xAC;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue); /* I signal */
+	BBPValue = 0x3F;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+	BBPValue = 0xAD;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue); /* Q signal */
+	BBPValue = 0x3F;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+	/* enable tone gen */
+	BBPValue = 0x40;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R244, BBPValue);
+
+	/* step 6 : adjust BBP Tx power(not necessary so far) */
+#ifdef RELEASE_EXCLUDE
+	/* (Img.LO<main.LO-40dB, at least 8~10dBm) */
+#endif /* RELEASE_EXCLUDE */
+
+	/* set RF loopback VGA gain B5.R3(has done in step 1) */
+
+	return;
+}
+
+
+static VOID RFConfigStore(RTMP_ADAPTER *pAd, RF_REG_PAIR rf_reg_record[][13], IN UCHAR chain)
+{
+	UCHAR RFValue = 0;
+
+	if (chain == CHAIN_0)
+	{
+		/* save before config */
+		RT635xReadRFRegister(pAd, RF_BANK0, RF_R00, &RFValue);
+		rf_reg_record[0][0].Bank = RF_BANK0;
+		rf_reg_record[0][0].Register = RF_R00;
+		rf_reg_record[0][0].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK0, RF_R02, &RFValue);
+		rf_reg_record[0][1].Bank = RF_BANK0;
+		rf_reg_record[0][1].Register = RF_R02;
+		rf_reg_record[0][1].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK4, RF_R02, &RFValue);
+		rf_reg_record[0][2].Bank = RF_BANK4;
+		rf_reg_record[0][2].Register = RF_R02;
+		rf_reg_record[0][2].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK4, RF_R34, &RFValue);
+		rf_reg_record[0][3].Bank = RF_BANK4;
+		rf_reg_record[0][3].Register = RF_R34;
+		rf_reg_record[0][3].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK5, RF_R17, &RFValue);
+		rf_reg_record[0][4].Bank = RF_BANK5;
+		rf_reg_record[0][4].Register = RF_R17;
+		rf_reg_record[0][4].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK5, RF_R18, &RFValue);
+		rf_reg_record[0][5].Bank = RF_BANK5;
+		rf_reg_record[0][5].Register = RF_R18;
+		rf_reg_record[0][5].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK5, RF_R19, &RFValue);
+		rf_reg_record[0][6].Bank = RF_BANK5;
+		rf_reg_record[0][6].Register = RF_R19;
+		rf_reg_record[0][6].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK5, RF_R20, &RFValue);
+		rf_reg_record[0][7].Bank = RF_BANK5;
+		rf_reg_record[0][7].Register = RF_R20;
+		rf_reg_record[0][7].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK5, RF_R03, &RFValue);
+		rf_reg_record[0][8].Bank = RF_BANK5;
+		rf_reg_record[0][8].Register = RF_R03;
+		rf_reg_record[0][8].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK5, RF_R04, &RFValue);
+		rf_reg_record[0][9].Bank = RF_BANK5;
+		rf_reg_record[0][9].Register = RF_R04;
+		rf_reg_record[0][9].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK4, RF_R00, &RFValue);
+		rf_reg_record[0][10].Bank = RF_BANK4;
+		rf_reg_record[0][10].Register = RF_R00;
+		rf_reg_record[0][10].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK0, RF_R35, &RFValue);
+		rf_reg_record[0][11].Bank = RF_BANK0;
+		rf_reg_record[0][11].Register = RF_R35;
+		rf_reg_record[0][11].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK0, RF_R42, &RFValue);
+		rf_reg_record[0][12].Bank = RF_BANK0;
+		rf_reg_record[0][12].Register = RF_R42;
+		rf_reg_record[0][12].Value = RFValue;
+
+	}
+	else if (chain == CHAIN_1)
+	{
+		/* save before config */
+		RT635xReadRFRegister(pAd, RF_BANK0, RF_R00, &RFValue);
+		rf_reg_record[1][0].Bank = RF_BANK0;
+		rf_reg_record[1][0].Register = RF_R00;
+		rf_reg_record[1][0].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK0, RF_R02, &RFValue);
+		rf_reg_record[1][1].Bank = RF_BANK0;
+		rf_reg_record[1][1].Register = RF_R02;
+		rf_reg_record[1][1].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK6, RF_R02, &RFValue);
+		rf_reg_record[1][2].Bank = RF_BANK6;
+		rf_reg_record[1][2].Register = RF_R02;
+		rf_reg_record[1][2].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK6, RF_R34, &RFValue);
+		rf_reg_record[1][3].Bank = RF_BANK6;
+		rf_reg_record[1][3].Register = RF_R34;
+		rf_reg_record[1][3].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK7, RF_R17, &RFValue);
+		rf_reg_record[1][4].Bank = RF_BANK7;
+		rf_reg_record[1][4].Register = RF_R17;
+		rf_reg_record[1][4].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK7, RF_R18, &RFValue);
+		rf_reg_record[1][5].Bank = RF_BANK7;
+		rf_reg_record[1][5].Register = RF_R18;
+		rf_reg_record[1][5].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK7, RF_R19, &RFValue);
+		rf_reg_record[1][6].Bank = RF_BANK7;
+		rf_reg_record[1][6].Register = RF_R19;
+		rf_reg_record[1][6].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK7, RF_R20, &RFValue);
+		rf_reg_record[1][7].Bank = RF_BANK7;
+		rf_reg_record[1][7].Register = RF_R20;
+		rf_reg_record[1][7].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK7, RF_R03, &RFValue);
+		rf_reg_record[1][8].Bank = RF_BANK7;
+		rf_reg_record[1][8].Register = RF_R03;
+		rf_reg_record[1][8].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK7, RF_R04, &RFValue);
+		rf_reg_record[1][9].Bank = RF_BANK7;
+		rf_reg_record[1][9].Register = RF_R04;
+		rf_reg_record[1][9].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK6, RF_R00, &RFValue);
+		rf_reg_record[1][10].Bank = RF_BANK6;
+		rf_reg_record[1][10].Register = RF_R00;
+		rf_reg_record[1][10].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK0, RF_R35, &RFValue);
+		rf_reg_record[1][11].Bank = RF_BANK0;
+		rf_reg_record[1][11].Register = RF_R35;
+		rf_reg_record[1][11].Value = RFValue;
+		RT635xReadRFRegister(pAd, RF_BANK0, RF_R42, &RFValue);
+		rf_reg_record[1][12].Bank = RF_BANK0;
+		rf_reg_record[1][12].Register = RF_R42;
+		rf_reg_record[1][12].Value = RFValue;
+
+	}
+	else
+	{
+		DBGPRINT_ERR(("%s: Unknown chain = %u\n", __FUNCTION__, chain));
+		return;
+	}
+
+	return;
+}
+
+
+static VOID RFConfigRecover(RTMP_ADAPTER *pAd, RF_REG_PAIR RF_record[][13])
+{
+	UCHAR chain_index = 0, record_index = 0;
+	UCHAR bank = 0, rf_register = 0, value = 0;
+
+	for (chain_index = 0; chain_index < 2; chain_index++)
+	{
+		for (record_index = 0; record_index < 13; record_index++)
+		{
+			bank = RF_record[chain_index][record_index].Bank;
+			rf_register = RF_record[chain_index][record_index].Register;
+			value = RF_record[chain_index][record_index].Value;			
+			RT635xWriteRFRegister(pAd, bank, rf_register, value);
+		}
+	}
+
+#if 1 /* from Keter @ 2012/06/04 */
+	/* for chain 0 */
+	value = 0xE6;
+	RT635xWriteRFRegister(pAd, RF_BANK4, RF_R34, value);
+
+	/* for chain 1 */
+	value = 0xE6;
+	RT635xWriteRFRegister(pAd, RF_BANK6, RF_R34, value);
+#endif /* 1 */
+
+	return;
+}
+
+static VOID RF_Aux_Loopback(RTMP_ADAPTER *pAd, RF_REG_PAIR rf_reg_record[][13], UCHAR chain)
+{
+	UCHAR RFValue = 0;
+
+	if (chain == CHAIN_0)
+	{
+		/* config */
+		RFValue = 0x21;
+		RT635xWriteRFRegister(pAd, RF_BANK0, RF_R00, RFValue);
+		RFValue = 0x10;
+		RT635xWriteRFRegister(pAd, RF_BANK0, RF_R02, RFValue);
+		RFValue = 0x00;
+		RT635xWriteRFRegister(pAd, RF_BANK0, RF_R35, RFValue);
+		RFValue = 0x1B;
+		RT635xWriteRFRegister(pAd, RF_BANK0, RF_R42, RFValue);
+		RFValue = 0x81;
+		RT635xWriteRFRegister(pAd, RF_BANK4, RF_R00, RFValue);
+		RFValue = 0x81;
+		RT635xWriteRFRegister(pAd, RF_BANK4, RF_R02, RFValue);
+		RFValue = 0xEE;
+		RT635xWriteRFRegister(pAd, RF_BANK4, RF_R34, RFValue);
+		RFValue = 0x38;
+		RT635xWriteRFRegister(pAd, RF_BANK5, RF_R03, RFValue);
+		RFValue = 0x38;
+		RT635xWriteRFRegister(pAd, RF_BANK5, RF_R04, RFValue);
+		RFValue = 0x80;
+		RT635xWriteRFRegister(pAd, RF_BANK5, RF_R17, RFValue);
+		RFValue = 0xD7;
+		RT635xWriteRFRegister(pAd, RF_BANK5, RF_R18, RFValue);
+		RFValue = 0xA2;
+		RT635xWriteRFRegister(pAd, RF_BANK5, RF_R19, RFValue);
+		RFValue = 0x20;
+		RT635xWriteRFRegister(pAd, RF_BANK5, RF_R20, RFValue);
+	}
+	else /* chain 1 */
+	{
+		/* config */
+		RFValue = 0x22;
+		RT635xWriteRFRegister(pAd, RF_BANK0, RF_R00, RFValue);
+		RFValue = 0x20;
+		RT635xWriteRFRegister(pAd, RF_BANK0, RF_R02, RFValue);
+		RFValue = 0x00;
+		RT635xWriteRFRegister(pAd, RF_BANK0, RF_R35, RFValue);
+		RFValue = 0x4B;
+		RT635xWriteRFRegister(pAd, RF_BANK0, RF_R42, RFValue);
+		RFValue = 0x81;
+		RT635xWriteRFRegister(pAd, RF_BANK6, RF_R00, RFValue);
+		RFValue = 0x81;
+		RT635xWriteRFRegister(pAd, RF_BANK6, RF_R02, RFValue);
+		RFValue = 0xEE;
+		RT635xWriteRFRegister(pAd, RF_BANK6, RF_R34, RFValue);
+		RFValue = 0x38;
+		RT635xWriteRFRegister(pAd, RF_BANK7, RF_R03, RFValue);
+		RFValue = 0x38;
+		RT635xWriteRFRegister(pAd, RF_BANK7, RF_R04, RFValue);
+		RFValue = 0x80;
+		RT635xWriteRFRegister(pAd, RF_BANK7, RF_R17, RFValue);
+		RFValue = 0xD7;
+		RT635xWriteRFRegister(pAd, RF_BANK7, RF_R18, RFValue);
+		RFValue = 0xA2;
+		RT635xWriteRFRegister(pAd, RF_BANK7, RF_R19, RFValue);
+		RFValue = 0x20;
+		RT635xWriteRFRegister(pAd, RF_BANK7, RF_R20, RFValue);
+	}
+
+	return;
+}
+
+
+static VOID RFConfigLoad(RTMP_ADAPTER *pAd, RF_REG_PAIR rf_reg_record[][13], IN UCHAR chain)
+{
+	/* step 1 */
+	if ((chain == CHAIN_0) || (chain == CHAIN_1))
+	{
+		RF_Aux_Loopback(pAd, rf_reg_record, chain);
+	}
+	else
+	{
+		DBGPRINT_ERR(("%s: Unknown chain = %u\n", __FUNCTION__, chain));
+		return;
+	}
+
+	return;
+}
+
+
+static VOID LOFT_DC_Sweet(RTMP_ADAPTER *pAd, IN UCHAR rf_alc_index, IN UCHAR sweet_index, IN UCHAR path, IN UCHAR chain)
+{
+	UCHAR dc_range[] = {0x80, 0x81, 0x82, 0x83};
+	UCHAR BBPValue = 0, rf_alc_idx = 0;;
+
+	for (rf_alc_idx = 0; rf_alc_idx < RF_ALC_NUM /* == sizeof(dc_range) */; rf_alc_idx++)
+	{
+		BBPValue = 0xB0;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+/*		BBPValue = dc_range[rf_alc_index]; */
+		BBPValue = dc_range[rf_alc_idx];
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+		if (path == I_PATH)
+		{
+			/* sweet DC value of I */
+			BBPValue = (chain == CHAIN_0)? 0xB1:0xB8;
+			RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+			BBPValue = SweetRange[sweet_index];
+			RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+		}
+		else if (path == Q_PATH)
+		{
+			/* sweet DC value of I */
+			BBPValue = (chain == CHAIN_0)? 0xB2:0xB9;
+			RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+			BBPValue = SweetRange[sweet_index];
+			RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+		}
+		else
+		{
+			DBGPRINT_ERR(("%s: Unknown path = %u\n", __FUNCTION__, path));
+			return;
+		}
+	}
+}
+
+
+static VOID LOFT_Calibration(RTMP_ADAPTER *pAd, OUT UCHAR LOFT_DC_Search_Result[][RF_ALC_NUM][2], IN UCHAR chain)
+{
+	LONG Ypwr = 0, Ytemp = 0;
+	INT32 I_output = 0, Q_output = 0;
+	UINT32 MacValue = 0;
+//	UCHAR RF_gain[] = {0x0, 0x4, 0x8, 0xC}; /* For E1 LOFT */
+	UCHAR RF_gain[] = {0x0, 0x1, 0x2, 0x3}; /* For E1 LOFT */
+//    UCHAR BBP_2324gain[] = {0x17,0x10,0x10,0x10};
+	UCHAR BBP_2324gain[] = {0x14,0x12,0x10,0x14};
+//	UCHAR VGA_gain[] = {0x2e, 0x2c, 0x28, 0x25}; /* For E1 LOFT */
+//	UCHAR VGA_gain[] = {0x27, 0x25, 0x25, 0x24}; /* For E1 LOFT */
+	UCHAR VGA_gain[] = {0x27, 0x27, 0x27,0x27}; /* For E1 LOFT */
+	UCHAR RFValue = 0;
+	UCHAR iorq = 0;
+	UCHAR rf_alc_idx = 0, sweet_idx = 0;
+	UCHAR index0 = 0,index1 = 0;
+	UCHAR index_final[] = {0x00, 0x00};
+	LONG pwr0 = 0, pwr1 = 0, pwr_final = 0;
+	UCHAR inverted_bit = 0x20;
+	UCHAR BBPValue = 0;
+	CHAR index = 0;
+
+	ASSERT(sizeof(SweetRange) == DC_SWEET_NUM); /* UCHAR SweetRange[61] */
+
+	/* calibrate for I-path chain 0 */
+	for (rf_alc_idx = 0; rf_alc_idx < RF_ALC_NUM /* == sizeof(dc_range) */; rf_alc_idx++)
+	{
+		/* step 6 */
+		/* Fix RF ALC */
+		RTMP_IO_READ32(pAd, 0x0530, &MacValue);
+		MacValue &= (~0x0000F1F1);
+		MacValue |= (RF_gain[rf_alc_idx] << 4);
+		MacValue |= (RF_gain[rf_alc_idx] << 12);
+		RTMP_IO_WRITE32(pAd, 0x0530, MacValue);
+
+		/* RTMP_IO_READ32(pAd, 0x0534, &MacValue); */
+		/* MacValue &= (~0x0000F1F1); */
+		MacValue = (0x0000F1F1);
+		RTMP_IO_WRITE32(pAd, 0x0534, MacValue);
+
+		RFValue = VGA_gain[rf_alc_idx];
+		RT635xWriteRFRegister(pAd, RF_BANK5, RF_R03, RFValue);
+		RT635xWriteRFRegister(pAd, RF_BANK5, RF_R04, RFValue);
+		RT635xWriteRFRegister(pAd, RF_BANK7, RF_R03, RFValue);
+		RT635xWriteRFRegister(pAd, RF_BANK7, RF_R04, RFValue);
+		BBPValue = BBP_R5;
+               	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+        	BBPValue = 0x00;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+		BBPValue = BBP_R1;
+               	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+        	BBPValue = chain;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R23, BBP_2324gain[rf_alc_idx]);
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R24, BBP_2324gain[rf_alc_idx]);
+
+	        index_final[0] = 32;
+	        index_final[1] = 32;
+	        pwr_final = 0;
+		inverted_bit = 0x20;
+	        for (index = 5; index>=0; index = index-1){
+    			for (iorq = 0; iorq < 2; iorq = iorq+1)	{
+	    			if(index_final[iorq] == 0x0){
+		                	index0 = 0x0;
+					pwr0 = pwr_final;
+				}
+		                else {
+					index0 = index_final[iorq] - inverted_bit;
+					/* step 2~5 */
+			                LOFT_DC_Sweet(pAd, rf_alc_idx, index0, iorq, chain);
+			                I_output = 0;
+    					Q_output = 0;
+					ReadFFT(pAd, &I_output, &Q_output, LOFT);
+
+					if (I_output >= 0x10000)
+						I_output = (I_output - 131072);
+
+					if (Q_output >= 0x10000)
+						Q_output = (Q_output - 131072);
+
+					/* power calculation */
+					Ypwr = ((LONG)((I_output*I_output)+(Q_output*Q_output)));           
+    					DBGPRINT(RT_DEBUG_TRACE, ("ALC index= %u, VGA gain = %u, DC index= %u\n", rf_alc_idx, VGA_gain[rf_alc_idx], index0));
+					DBGPRINT(RT_DEBUG_TRACE, ("ALC= 0x%02x, DC= 0x%02x, Yi= %6d, Yq= %6d, Ypwr= 0x%16x\n",
+ 						RF_gain[rf_alc_idx], SweetRange[index0], I_output, Q_output, Ypwr));
+					pwr0 = Ypwr;
+				}
+
+                
+                		index1 = index_final[iorq] + ((index==5) ? 0 : inverted_bit);
+		                LOFT_DC_Sweet(pAd, rf_alc_idx, index1, iorq, chain);
+		                I_output = 0;
+    				Q_output = 0;
+				ReadFFT(pAd, &I_output, &Q_output, LOFT);
+
+				if (I_output >= 0x10000)
+					I_output = (I_output - 131072);
+
+				if (Q_output >= 0x10000)
+					Q_output = (Q_output - 131072);
+
+    
+				/* power calculation */
+				Ypwr = ((LONG)((I_output*I_output)+(Q_output*Q_output)));			
+    				DBGPRINT(RT_DEBUG_TRACE, ("ALC index= %u, VGA gain = %u, DC index= %u\n", rf_alc_idx, VGA_gain[rf_alc_idx], index1));
+				DBGPRINT(RT_DEBUG_TRACE, ("ALC= 0x%02x, DC= 0x%02x, Yi= %6d, Yq= %6d, Ypwr= 0x%16x\n",
+    					RF_gain[rf_alc_idx], SweetRange[index1], I_output, Q_output, Ypwr));
+				pwr1 = Ypwr;
+                
+
+	    			if((index!=5) && (pwr_final <= pwr0) && (pwr_final < pwr1)){
+		                	pwr_final = pwr_final;
+					index_final[iorq] = index_final[iorq];
+				}
+		                else if(pwr0 < pwr1){
+					pwr_final = pwr0;
+					index_final[iorq] = index0;
+				}
+				else{
+					pwr_final = pwr1;
+					index_final[iorq] = index1;
+				}
+
+				LOFT_DC_Sweet(pAd, rf_alc_idx, index_final[iorq], iorq, chain);
+
+            		} // for iorq 
+			inverted_bit = (inverted_bit >> 1);
+	        } // for index            
+			/******/
+   		for (iorq = 0; iorq < 2; iorq = iorq+1)
+   		{
+			LOFT_DC_Search_Result[chain][rf_alc_idx][iorq] = SweetRange[index_final[iorq]];
+			Ytemp = pwr_final;
+			DBGPRINT(RT_DEBUG_TRACE, ("\nALC index= %u , IorQ = %u ==> Minimum Ypwr= 0x%16x, Relative DC= 0x%02x\n",
+				rf_alc_idx, iorq, Ytemp, LOFT_DC_Search_Result[chain][rf_alc_idx][iorq]));            
+		}
+	} // for alc_idx
+
+}
+
+
+static VOID IQ_DC_Compensation(RTMP_ADAPTER *pAd, UCHAR loft_dc_compensation[][RF_ALC_NUM][2], IN UCHAR chain)
+{
+	UCHAR BBPValue = 0;
+	UCHAR rf_alc = 0;
+
+	if (chain == CHAIN_0)
+	{
+		BBPValue = 0xB1;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+		BBPValue = loft_dc_compensation[CHAIN_0][rf_alc][I_PATH];
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+		BBPValue = 0xB2;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+		BBPValue = loft_dc_compensation[CHAIN_0][rf_alc][Q_PATH];
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+	}
+	else if (chain == CHAIN_1)
+	{
+		BBPValue = 0xB8;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+		BBPValue = loft_dc_compensation[CHAIN_1][rf_alc][I_PATH];
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+		BBPValue = 0xB9;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+		BBPValue = loft_dc_compensation[CHAIN_1][rf_alc][Q_PATH];
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+	}
+	else
+	{
+		DBGPRINT_ERR(("%s: Unknown chain = %u\n", __FUNCTION__, chain));
+	}
+
+	return;
+}
+
+
+/* Calibrate IQ gain/phase imbalance */
+static VOID IQ_LOFT_Compensation(RTMP_ADAPTER *pAd, UCHAR loft_dc_compensation[][RF_ALC_NUM][2], IN UCHAR chain)
+{
+	UCHAR dc_range[RF_ALC_NUM] = {0x80, 0x81, 0x82, 0x83};
+	UCHAR BBPValue = 0;
+	UCHAR dc_idx = 0;
+
+	for (dc_idx = 0; dc_idx < RF_ALC_NUM ; dc_idx++)
+	{
+		BBPValue = 0xB0;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+		BBPValue = dc_range[dc_idx];
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+	 
+		IQ_DC_Compensation(pAd, loft_dc_compensation, chain);
+	}
+
+	return;
+}
+
+
+static VOID IQ_Gain_Phase_Calibration(RTMP_ADAPTER *pAd, OUT UCHAR *IQ_gain_error, OUT UCHAR *IQ_phase_error, UCHAR dc_compensation[][RF_ALC_NUM][2], IN UCHAR chain)
+{
+	LONG Ypwr = 0, pwr0 = 0, pwr1 = 0, pwr_final = 0;
+	INT32 I_output = 0, Q_output = 0;
+	INT32 i = 0;	
+	INT32 iorq = 0;
+	UINT32 MacValue = 0;
+	UCHAR BBPValue = 0;
+	UCHAR RF_gain = 0x10; /* For E1 IQ */
+	UCHAR phase_err = 32, gain_err = 8, iq_err = 0, iorq_pre = 2, iq_err_pre = 0;
+	UCHAR inverted_bit = 0x20;
+	UCHAR first_search = 0x00, touch_neg_max = 0x00;
+	UCHAR index0 = 0,index1 = 0;
+
+	UCHAR gain_error[] = {  0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 
+							0x00,
+							0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07};
+							
+	UCHAR phi_error[] = {   0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+							0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F,
+							0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+							0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 
+							0x00, 
+							0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+							0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+							0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+							0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F};
+
+	/* calibrate IQ gain of chain 0 */
+	
+	
+	phase_err = 32;
+	gain_err = 8;
+	inverted_bit = 0x20;
+	
+	/* step 2~5 */
+	/* step 10.a~c */
+	IQ_LOFT_Compensation(pAd, dc_compensation, chain);
+
+	/* step 10.d~e */
+	/* enable Tx Amp compensation (bbp and RF) */		
+	BBPValue = 0x03;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	BBPValue = 0x60;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+	/* step 2~5 */
+       	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBP_R5);
+    	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, 0x04);
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R23, 0x1a);
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R24, 0x1a);
+	
+	for(i = 5 ; i >=-1; i = i-1)
+	{
+		/* step 6 */
+		/* Fix RF ALC */
+#if 0
+		RTMP_IO_READ32(pAd, 0x13B8, &MacValue);
+		MacValue &= (~0x000000FF);
+		MacValue |= RF_gain;
+		RTMP_IO_WRITE32(pAd, 0x13B8, MacValue);	
+#endif
+		for(iorq = 1 ; (iorq < 2) & (iorq >= 0) ; iorq = iorq -1)
+		{
+			if((i<4) | (iorq == 0))
+			{
+				if(iorq == 0) // Phase
+					iq_err = phase_err;
+				else
+					iq_err = gain_err;
+
+				first_search = (iorq == 0) ? (i==5) : (i==3);
+				touch_neg_max = (iq_err  == 0x0);
+
+				// index0
+				if(touch_neg_max)
+				{
+					pwr0 = pwr_final;
+					index0 = iq_err;
+				}
+				else
+				{
+					index0 = iq_err - inverted_bit;
+
+					if(chain == 0){
+						BBPValue = 0x29; //phase
+				                RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+						BBPValue = phi_error[(iorq == 0) ? index0 : phase_err];
+						RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+						
+						BBPValue = 0x28; //gain
+						RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+						BBPValue = gain_error[(iorq != 0) ? index0 : gain_err];
+						RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+					}
+					else{
+						BBPValue = 0x47; //phase
+						RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+						BBPValue = phi_error[(iorq == 0) ? index0 : phase_err];
+						RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+						
+						BBPValue = 0x46; //gain
+						RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+						BBPValue = gain_error[(iorq != 0) ? index0 : gain_err];
+						RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+					}
+
+					/* enable Rx calibration and read FFT output */
+					I_output = 0;
+					Q_output = 0;
+					ReadFFT(pAd, &I_output, &Q_output, IQ);
+
+					if (I_output >= 0x10000)
+						I_output = (I_output - 0x20000);
+
+					if (Q_output >= 0x10000)
+						Q_output = (Q_output - 0x20000);
+
+					/* power calculation */
+					pwr0 = ((LONG)((I_output*I_output)+(Q_output*Q_output)));	
+
+					DBGPRINT(RT_DEBUG_TRACE, ("iorq = %u, iq_error index_R= %u\n", iorq, index0));
+					
+					if(iorq==0)// Phase
+						DBGPRINT(RT_DEBUG_TRACE, ("Phase_error= 0x%02x, Yi= %6d, Yq= %6d, Ypwr= 0x%16x\n",
+							phi_error[index0], I_output, Q_output, pwr0));
+					else
+						DBGPRINT(RT_DEBUG_TRACE, ("Gain_error= 0x%02x, Yi= %6d, Yq= %6d, Ypwr= 0x%16x\n",
+							gain_error[index0], I_output, Q_output, pwr0));
+					
+				} // touch_neg_max
+				
+				
+
+				/* step 10.a~c */
+				IQ_LOFT_Compensation(pAd, dc_compensation, chain);
+
+				/* step 10.d~e */
+				/* enable Tx Amp compensation (bbp and RF) */
+				BBPValue = 0x03;
+				RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+				BBPValue = 0x60;
+				RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+		
+				// index1
+				index1 = iq_err + (first_search ? 0 : inverted_bit);
+				if(chain == 0)	{
+					BBPValue = 0x29; //phase
+					RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+					BBPValue = phi_error[(iorq == 0) ? index1 : phase_err];
+				       	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+						
+					BBPValue = 0x28; //gain
+					RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+					BBPValue = gain_error[(iorq != 0) ? index1 : gain_err];
+					RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+				}
+				else{
+					BBPValue = 0x47; //phase
+					RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+					BBPValue = phi_error[(iorq == 0) ? index1 : phase_err];
+					RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+						
+					BBPValue = 0x46; //gain
+					RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+					BBPValue = gain_error[(iorq != 0) ? index1 : gain_err];
+					RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+				}
+
+				/* enable Rx calibration and read FFT output */
+				I_output = 0;
+				Q_output = 0;
+				ReadFFT(pAd, &I_output, &Q_output, IQ);
+
+				if (I_output >= 0x10000)
+					I_output = (I_output - 131072);
+		
+				if (Q_output >= 0x10000)
+					Q_output = (Q_output - 131072);
+
+				/* power calculation */
+				pwr1 = ((LONG)((I_output*I_output)+(Q_output*Q_output)));	
+
+				DBGPRINT(RT_DEBUG_TRACE, ("iorq = %u, iq_error index_L= %u\n", iorq, index1));
+				
+				if(iorq==0)// Phase
+					DBGPRINT(RT_DEBUG_TRACE, ("Phase_error= 0x%02x, Yi= %6d, Yq= %6d, Ypwr= 0x%16x\n",
+						phi_error[index1], I_output, Q_output, pwr1));
+				else
+					DBGPRINT(RT_DEBUG_TRACE, ("Gain_error= 0x%02x, Yi= %6d, Yq= %6d, Ypwr= 0x%16x\n",
+						gain_error[index1], I_output, Q_output, pwr1));
+
+				/* step 10.a~c */
+				IQ_LOFT_Compensation(pAd, dc_compensation, chain);
+
+				/* step 10.d~e */
+				/* enable Tx Amp compensation (bbp and RF) */		
+				BBPValue = 0x03;
+				RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+				BBPValue = 0x60;
+				RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+				if((!first_search) && (pwr_final <= pwr0) && (pwr_final < pwr1))
+					pwr_final = pwr_final;
+				else if(pwr0 < pwr1){
+					pwr_final = pwr0;
+					iq_err = index0;
+				}
+				else{
+					pwr_final = pwr1;
+					iq_err = index1;
+				}
+
+				if(chain == 0){
+					BBPValue = (iorq == 0) ? 0x29 : 0x28;
+					RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+
+					BBPValue = (iorq == 0) ? phi_error[iq_err] : gain_error[iq_err];
+					RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+				}
+				else{
+					BBPValue = (iorq == 0) ? 0x47 : 0x46;
+					RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+					
+ 					BBPValue = (iorq == 0) ? phi_error[iq_err] : gain_error[iq_err];
+					RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+				}
+
+				if(iorq == 0) // Phase
+					phase_err = iq_err;
+				else
+					gain_err = iq_err;
+
+				iorq_pre = iorq;
+				iq_err_pre = iq_err;
+
+			}
+		} // for iorq
+		if( i > 0)
+	  		inverted_bit = (inverted_bit >> 1);
+	} // for i
+	IQ_phase_error[chain] = phi_error[phase_err];
+	DBGPRINT(RT_DEBUG_TRACE, ("\nPhase_error index= %u\n", phase_err));
+	DBGPRINT(RT_DEBUG_TRACE, ("Phase_error= 0x%02x\n\n", phi_error[phase_err]));
+
+	IQ_gain_error[chain] = gain_error[gain_err];
+	DBGPRINT(RT_DEBUG_TRACE, ("Gain_error index= %u\n", gain_err));
+	DBGPRINT(RT_DEBUG_TRACE, ("Gain_error= 0x%02x\n\n", gain_error[gain_err]));
+	
+	return;
+	
+}
+
+VOID LOFT_Calibration_Result_Apply(RTMP_ADAPTER *pAd, IN UCHAR LOFT_DC_Search_Result[][RF_ALC_NUM][2])
+{
+	UCHAR rf_alc_idx = 0;
+	UCHAR BBPValue = 0;
+	
+	for (rf_alc_idx = 0; rf_alc_idx < 15; rf_alc_idx++)
+	{
+		BBPValue = BBP_R176;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+		BBPValue = rf_alc_idx;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+		/* DC I chain 0 */
+		BBPValue = BBP_R177;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+		BBPValue = LOFT_DC_Search_Result[CHAIN_0][rf_alc_idx&0x3][I_PATH];
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+		/* DC Q chain 0 */
+		BBPValue = BBP_R178;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+		BBPValue = LOFT_DC_Search_Result[CHAIN_0][rf_alc_idx&0x3][Q_PATH];
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+		/* DC I chain 1 */
+		BBPValue = BBP_R184;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+		BBPValue = LOFT_DC_Search_Result[CHAIN_1][rf_alc_idx&0x3][I_PATH];
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+		/* DC Q chain 1 */
+		BBPValue = BBP_R185;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+		BBPValue = LOFT_DC_Search_Result[CHAIN_1][rf_alc_idx&0x3][Q_PATH];
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+	}	
+}
+
+
+VOID IQ_Calibration_Result_Apply(RTMP_ADAPTER *pAd,
+			IN UCHAR *IQ_GAIN_Search_Result,  IN UCHAR *IQ_PHASE_Search_Result)
+{
+	UCHAR BBPValue = 0;
+
+	/* Tx0 Gain Error */
+	BBPValue = BBP_R40;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	BBPValue = IQ_GAIN_Search_Result[CHAIN_0];
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+	/* Tx1 Gain Error */
+	BBPValue = BBP_R70;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	BBPValue = IQ_GAIN_Search_Result[CHAIN_1];
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+	/* Tx0 Phase Error */
+	BBPValue = BBP_R41;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	BBPValue = IQ_PHASE_Search_Result[CHAIN_0];
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+	/* Tx1 Phase Error */
+	BBPValue = BBP_R71;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	BBPValue = IQ_PHASE_Search_Result[CHAIN_1];
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+	return;
+}
+static VOID SetBbpToneGenerator(
+	IN RTMP_ADAPTER *pAd)
+{
+	UCHAR BBPValue = 0;
+
+	/* choose FFT tone generator index (to 0) */
+	BBPValue = 0xaa;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	BBPValue = 0x00;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+	/* set subcarrier index (subsample ratio to 10 * 0.3125MHz) */
+	BBPValue = 0xab;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	BBPValue = 0x0a;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+	/* I/Q amplitude of tone gen0 */
+	BBPValue = 0xac;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue); /* I signal */
+	BBPValue = 0x3f;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+	BBPValue = 0xad;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue); /* Q signal */
+	BBPValue = 0x3f;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+	/* enable tone gen */
+	BBPValue = 0x40;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R244, BBPValue);
+
+	return;
+}
+
+#define _BBP_REG_NUM	168
+VOID LOFT_IQ_Calibration(RTMP_ADAPTER *pAd)
+{
+	RF_REG_PAIR RF_Record[CHAIN_NUM][13];
+	RF_REG_PAIR RF_Store[CHAIN_NUM][13];
+	UINT32 MacValue = 0;
+	UINT32 MacOrg1 = 0; /* TX_PIN_CFG */
+	UINT32 MacOrg2 = 0; /* RF_CONTROL0 */
+	UINT32 MacOrg3 = 0; /* RF_BYPASS0 */
+	UINT32 bbp_index = 0;
+	UINT32 saveMacSysCtrl = 0, MTxCycle = 0;
+	UCHAR BBPBackUp[_BBP_REG_NUM]={0};
+	UCHAR LOFT_Min_Pwr_Relative_DC[CHAIN_NUM][RF_ALC_NUM][2]; /* 0: I_PATH; 1: Q_PATH */
+	UCHAR IQ_Gain_Result[2], IQ_Phase_Result[2]; /* 0: CHAIN_0; 1: CHAIN_1 */
+	UCHAR chain_idx = 0, BBPValue = 0;
+	UCHAR RestoreRfICType = pAd->RfIcType;
+
+
+	/* backup before MAC RF Interface config */
+	RTMP_IO_READ32(pAd, TX_PIN_CFG, &MacOrg1);
+	RTMP_IO_READ32(pAd, RF_CONTROL0, &MacOrg2);
+	RTMP_IO_READ32(pAd, RF_BYPASS0, &MacOrg3);
+	RTMP_IO_READ32(pAd, MAC_SYS_CTRL, &saveMacSysCtrl);
+
+	/* MAC Tx */
+	RTMP_IO_READ32(pAd, MAC_SYS_CTRL, &MacValue);
+	MacValue &= (~0x04);
+	RTMP_IO_WRITE32(pAd, MAC_SYS_CTRL, MacValue);
+	for (MTxCycle = 0; MTxCycle < 10000; MTxCycle++)
+	{
+		RTMP_IO_READ32(pAd, MAC_STATUS_CFG, &MacValue);
+		if (MacValue & 0x1)
+			RTMPusecDelay(50);
+		else
+			break;
+	}
+
+	/* MAC Rx */
+	RTMP_IO_READ32(pAd, MAC_SYS_CTRL, &MacValue);
+	MacValue &= (~0x08);
+	RTMP_IO_WRITE32(pAd, MAC_SYS_CTRL, MacValue);
+	for (MTxCycle = 0; MTxCycle < 10000; MTxCycle++)
+	{
+		RTMP_IO_READ32(pAd, MAC_STATUS_CFG, &MacValue);
+		if (MacValue & 0x2)
+			RTMPusecDelay(50);
+		else
+			break;
+	}
+
+	BBPValue = 0x48;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R31, BBPValue);
+	SetBbpToneGenerator(pAd);
+	/* backup before RF registers before config */
+	for (chain_idx = 0; chain_idx < 2; chain_idx++)
+	{
+		RFConfigStore(pAd, RF_Store, chain_idx);
+	}
+
+	/* start LOFT calibration */
+	for (chain_idx = 0; chain_idx < 2; chain_idx++)
+	{
+		/* step 1 for LOFT calibration */
+		RFConfigLoad(pAd, RF_Record, chain_idx);		
+
+		/* MAC RF Interface config */
+		MacValue = 0x0000000f;
+		RTMP_IO_WRITE32(pAd, TX_PIN_CFG, MacValue);
+		MacValue = 0x00003000;
+		RTMP_IO_WRITE32(pAd, RF_CONTROL0, MacValue);
+		MacValue = 0x00003000;
+		RTMP_IO_WRITE32(pAd, RF_BYPASS0, MacValue);
+
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, 0x1);
+		BBPValue = (chain_idx == 0) ? 0 : 1;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, (UINT8)BBPValue);
+
+		DBGPRINT(RT_DEBUG_TRACE, ("\n\n====>Start of LOFT calibration: chain%u\n", chain_idx));			
+ 		LOFT_Calibration(pAd, LOFT_Min_Pwr_Relative_DC, chain_idx);
+		DBGPRINT(RT_DEBUG_TRACE, ("\n<====End of LOFT calibration: chain%u\n", chain_idx));			
+	}
+
+	DBGPRINT(RT_DEBUG_TRACE, ("\n============================================\n"));			
+
+	/* start I/Q calibration */
+	for (chain_idx = 0; chain_idx < 2; chain_idx++)
+	{
+		/* step 1 for IQ calibration */
+		RFConfigLoad(pAd, RF_Record, chain_idx);		
+
+		/* MAC RF Interface config */
+		MacValue = 0x0000000f;
+		RTMP_IO_WRITE32(pAd, TX_PIN_CFG, MacValue);
+		MacValue = 0x00003000;
+		RTMP_IO_WRITE32(pAd, RF_CONTROL0, MacValue);
+		MacValue = 0x00003000;
+		RTMP_IO_WRITE32(pAd, RF_BYPASS0, MacValue);
+
+		RTMP_IO_WRITE32(pAd, RF_CONTROL3, 0x00000000);
+		RTMP_IO_WRITE32(pAd, RF_BYPASS3, 0x0000F1F1);
+		
+		RT635xWriteRFRegister(pAd, RF_BANK5, RF_R03, 0x3b);
+		RT635xWriteRFRegister(pAd, RF_BANK5, RF_R04, 0x3b);
+		RT635xWriteRFRegister(pAd, RF_BANK7, RF_R03, 0x3b);
+		RT635xWriteRFRegister(pAd, RF_BANK7, RF_R04, 0x3b);
+
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBP_R5);
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, 0x04);
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R23, 0x1a);
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R24, 0x1a);
+
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, 0x1);
+		BBPValue = (chain_idx == 0) ? 0 : 1;
+		RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, (UINT8)BBPValue);
+		
+		DBGPRINT(RT_DEBUG_TRACE, ("\n\n====>Start of IQ gain calibration: chain%u\n", chain_idx));			
+ 		IQ_Gain_Phase_Calibration(pAd, IQ_Gain_Result, IQ_Phase_Result, LOFT_Min_Pwr_Relative_DC, chain_idx);
+		DBGPRINT(RT_DEBUG_TRACE, ("\n<====End of IQ gain calibration: chain%u\n", chain_idx));			
+	}
+	
+	/* do once when the whole calibration is finished */	
+	RTMP_IO_WRITE32(pAd, TX_PIN_CFG, MacOrg1);
+	RTMP_IO_WRITE32(pAd, RF_CONTROL0, MacOrg2);
+	RTMP_IO_WRITE32(pAd, RF_BYPASS0, MacOrg3);
+	RTMP_IO_WRITE32(pAd, RF_BYPASS3, 0x00000000);
+	RTMP_IO_WRITE32(pAd, MAC_SYS_CTRL, saveMacSysCtrl);
+
+	BBPValue = 0x8;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R31, BBPValue);
+
+	RFConfigRecover(pAd, RF_Store);
+
+	BBPValue = 0x00;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R244, (UINT8)BBPValue);
+
+	/* change BBP Tx to normal state */
+	BBPValue = 0x00;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	BBPValue = 0x00;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+	/* BBP soft reset */
+	BBPValue = 0x01;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R21, BBPValue);
+	RTMPusecDelay(10);
+	BBPValue = 0x00;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R21, BBPValue);
+
+	NICInitBBP(pAd);
+
+	/* enabled Tx amp and phase compensation */
+	BBPValue = 0x03;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R158, BBPValue);
+	BBPValue = 0x60;
+	RTMP_BBP_IO_WRITE8_BY_REG_ID(pAd, BBP_R159, BBPValue);
+
+	/* write LOFT calibration result to BB registers */
+	LOFT_Calibration_Result_Apply(pAd, LOFT_Min_Pwr_Relative_DC);
+
+	/* write I/Q gain/phase search result to BB registers */
+	IQ_Calibration_Result_Apply(pAd, IQ_Gain_Result, IQ_Phase_Result);
+
+	return;
+
+}
+
+#endif /* LOFT_IQ_CAL_SUPPORT */
+#endif /* RT6352 */
+
